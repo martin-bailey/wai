@@ -12,7 +12,7 @@ import Network.Socket (Socket)
 import qualified Network.Wai.Handler.Warp.Date as D
 import qualified Network.Wai.Handler.Warp.FdCache as F
 import qualified Network.Wai.Handler.Warp.Timeout as T
-import Network.Wai.Handler.Warp.Buffer (Buffer,BufSize)
+import Network.Wai.Handler.Warp.Buffer (Buffer,BufferPool,BufSize)
 import qualified Data.ByteString as S
 import Data.IORef (IORef, readIORef, writeIORef, newIORef)
 
@@ -76,7 +76,9 @@ data Connection = Connection
     , connSendFile :: FilePath -> Integer -> Integer -> IO () -> [ByteString] -> IO () -- ^ filepath, offset, length, hook action, HTTP headers
     , connClose    :: IO ()
     , connRecv     :: IO ByteString
+    , connBufferPool :: BufferPool
     , connReadBuffer       :: Buffer
+    -- ^ NOTE: This is kept just for backwards compatibility, and is no longer used at all.
     , connWriteBuffer      :: Buffer
     , connBufferSize       :: BufSize
     , connSendFileOverride :: ConnSendFileOverride
