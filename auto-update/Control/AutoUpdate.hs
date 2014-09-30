@@ -28,7 +28,7 @@ import           Control.Concurrent (ThreadId, forkIO, myThreadId, threadDelay)
 import           Control.Exception  (Exception, SomeException
                                     ,assert, fromException, handle,throwIO, throwTo)
 import           Control.Monad      (forever, join)
-import           Data.IORef         (IORef, newIORef)
+import           Data.IORef         (IORef, newIORef, readIORef, writeIORef)
 import           Data.Typeable      (Typeable)
 
 -- | Default value for creating an @UpdateSettings@.
@@ -76,12 +76,12 @@ data UpdateSettings a = UpdateSettings
 
 data Status a = AutoUpdated
                     !a
-                    {-# UNPACK #-} !Int
+                    (IORef Int)
                     -- Number of times used since last updated.
                     {-# UNPACK #-} !ThreadId
                     -- Worker thread.
               | ManualUpdates
-                    {-# UNPACK #-} !Int
+                    (IORef Int)
                     -- Number of times used since we started/switched
                     -- off manual updates.
 
@@ -91,7 +91,8 @@ data Status a = AutoUpdated
 -- Since 0.1.0
 mkAutoUpdate :: UpdateSettings a -> IO (IO a)
 mkAutoUpdate us = do
-    istatus <- newIORef $ ManualUpdates 0
+    counter <- newIORef 0
+    istatus <- newIORef $ ManualUpdates $ counter
     return $! getCurrent us istatus
 
 data Action a = Return a | Manual | Spawn
@@ -107,7 +108,8 @@ getCurrent :: UpdateSettings a
            -> IORef (Status a) -- ^ mutable state
            -> IO a
 getCurrent settings@UpdateSettings{..} istatus = do
-    ea <- atomicModifyIORef' istatus increment
+--    status <- readIORef istatus
+    ea <- increment istatus
     case ea of
         Return a -> return a
         Manual   -> updateAction
@@ -117,10 +119,23 @@ getCurrent settings@UpdateSettings{..} istatus = do
             join $ atomicModifyIORef' istatus $ turnToAuto a tid
             return a
   where
-    increment (AutoUpdated a cnt tid) = (AutoUpdated a (succ cnt) tid, Return a)
-    increment (ManualUpdates i)       = (ManualUpdates (succ i),       act)
-      where
-        act = if i > updateSpawnThreshold then Spawn else Manual
+    increment istatus = do
+        status <- readIORef istatus
+        increment' status
+        where
+            increment' (AutoUpdated a counter tid) = do
+                cnt <- optimisticIncrement counter
+                return $ Return a
+            increment' (ManualUpdates counter) = do
+                cnt <- optimisticIncrement counter
+                return $ if cnt > updateSpawnThreshold then Spawn else Manual
+
+            optimisticIncrement :: IORef Int -> IO Int
+            optimisticIncrement counter = do
+                cnt <- readIORef counter
+                let inc = succ cnt
+                writeIORef counter inc
+                return inc
 
     -- Normal case.
     turnToAuto a tid (ManualUpdates cnt)     = (AutoUpdated a cnt tid
@@ -134,21 +149,31 @@ spawn :: UpdateSettings a -> IORef (Status a) -> IO ()
 spawn UpdateSettings{..} istatus = handle (onErr istatus) $ forever $ do
     threadDelay updateFreq
     a <- updateAction
-    join $ atomicModifyIORef' istatus $ turnToManual a
+    ea <- checkActivity istatus
+    case ea of
+        Return msg -> error msg
+        Manual -> stop -- turnToManual
+        Spawn -> return () -- keep running
   where
-    -- Normal case.
-    turnToManual a (AutoUpdated _ cnt tid)
-      | cnt >= 1                     = (AutoUpdated a 0 tid, return ())
-      | otherwise                    = (ManualUpdates 0, stop)
-    -- This case must not happen.
-    turnToManual _ (ManualUpdates i) =  assert False (ManualUpdates i, stop)
+    checkActivity :: IORef (Status a) -> IO (Action String)
+    checkActivity istatus = do
+        status <- readIORef istatus
+        checkActivity' status where
+            -- Normal case.
+            checkActivity' (AutoUpdated _ counter tid) = do
+                cnt <- readIORef counter
+                writeIORef counter 0
+                return $ if cnt >= 1 then Spawn else Manual
+            -- This case must not happen.
+            checkActivity' _ = return $ Return "Corrupt Status"
 
 onErr :: IORef (Status a) -> SomeException -> IO ()
 onErr istatus ex = case fromException ex of
     Just Replaced -> return () -- this thread is terminated
     Nothing -> do
         tid <- myThreadId
-        atomicModifyIORef' istatus $ clear tid
+        counter <- newIORef 0
+        atomicModifyIORef' istatus $ clear tid counter
         throwIO ex
   where
     -- In the race condition described above,
@@ -159,8 +184,8 @@ onErr istatus ex = case fromException ex of
     -- since it refers to thread B already.
     -- Solution: only switch back to manual updates
     -- if the IORef is pointing at the current thread.
-    clear tid (AutoUpdated _ _ tid') | tid == tid' = (ManualUpdates 0, ())
-    clear _   status                               = (status, ())
+    clear tid counter (AutoUpdated _ _ tid') | tid == tid' = (ManualUpdates counter, ())
+    clear _ _ status                                       = (status, ())
 
 -- | Throw an error to kill a thread.
 stop :: IO a
